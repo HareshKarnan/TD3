@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import gym
 import argparse
-import os
+import os, shutil
 import utils
 import TD3
 import OurDDPG
@@ -47,6 +47,8 @@ if __name__ == "__main__":
     parser.add_argument("--eval_freq", default=5e3, type=float)  # How often (time steps) we evaluate
     parser.add_argument("--fwd_model_update_freq", default=5e3, type=float)  # How often (time steps) we update the forward model
     parser.add_argument("--bwd_model_update_freq", default=5e3, type=float)  # How often (time steps) we update the backward model
+    parser.add_argument("--model_gradient_times", default=10, type=int)  # How many different gradient steps per update iteration ?
+
     parser.add_argument("--imagination_depth", default=1, type=int)  # How deep to propagate the fwd model
     parser.add_argument("--max_timesteps", default=1e6, type=int)  # Max time steps to run environment for
     parser.add_argument("--save_models", action="store_true")  # Whether or not models are saved
@@ -60,7 +62,10 @@ if __name__ == "__main__":
     parser.add_argument("--policy_freq", default=2, type=int)  # Frequency of delayed policy updates
     parser.add_argument("--model_based", default="None")  # What model should we use choose from forward / backward / None
     parser.add_argument("--model_iters", default=100, type=int)  # Frequency of delayed policy updates
-
+    parser.add_argument("--tensorboard", action="store_true")  # Show tensorboard logging ?
+    parser.add_argument("--log_training", action="store_true")  # Log current reward, timesteps, done to file for reading from later
+    parser.add_argument("--log_path", default="logs/") # root path for storing the experiment logs and saved models
+    parser.add_argument("--use_cuda", action="store_true")  # Use cuda acceleration
     args = parser.parse_args()
 
     file_name = "%s_%s_%s_%s" % (args.policy_name, args.env_name, str(args.model_based), str(args.seed))
@@ -68,19 +73,30 @@ if __name__ == "__main__":
     print(f"Settings: {file_name}")
     print("---------------------------------------")
 
-    if not os.path.exists("./results"):
-        os.makedirs("./results")
+    # if not os.path.exists("./results"):
+    #     os.makedirs("./results")
+
+    if args.use_cuda and torch.cuda.is_available() : device = "cuda"
+    else: device = "cpu"
 
     experiment_directory_name = \
     str(args.policy_name) + \
     '_env_' + str(args.env_name) + \
-    '_seed_'+str(args.seed) + \
-    '_model_based_' + str(args.model_based) + \
-    '_max_timesteps_' + str(args.max_timesteps) + \
-    '_model_iters_' + str(args.model_iters)
+    '_MB_' + str(args.model_based) + \
+    '_timesteps_' + str(args.max_timesteps) + \
+    '_M_iters_' + str(args.model_iters) + \
+    '_M_grad_' + str(args.model_gradient_times) + \
+    '_' + str(args.seed)
 
-    writer = SummaryWriter(log_dir='results/TrainingLogs/' + experiment_directory_name)
+    # did experiment launch already ?
+    if(os.path.exists(args.log_path+experiment_directory_name)):
+        shutil.rmtree(args.log_path + experiment_directory_name)
 
+    # create writer for tensorboard logging
+    if args.tensorboard: writer = SummaryWriter(log_dir='tblogs/' + experiment_directory_name)
+
+    if args.log_training: logger = utils.Logger(log_name = experiment_directory_name,
+                                                log_root=args.log_path)
 
     env = gym.make(args.env_name)
     print('-- CREATED ENVIRONMENT -- ')
@@ -95,13 +111,13 @@ if __name__ == "__main__":
         forward_dynamics_model = Net(n_feature=state_dim+action_dim,
                                      n_hidden=64,
                                      n_output=state_dim+1 # reward is the + 1
-                                     ).cuda()
+                                     ).to(device)
 
     elif args.model_based == "backward":
         backward_dynamics_model = Net(n_feature=state_dim + action_dim,
                                      n_hidden=64,
                                      n_output=state_dim+1 # reward is the + 1
-                                     ).cuda()
+                                     ).to(device)
 
     kwargs = {
         "state_dim": state_dim,
@@ -181,12 +197,12 @@ if __name__ == "__main__":
         # update the forward and backward models here
         if args.model_based == "forward":
             if (not first_update and t >= 1000) or (t >= args.fwd_model_update_freq and t % args.fwd_model_update_freq == 0):
-                fwd_norm = update_forward_model(forward_dynamics_model, Ts, checkpoint_name=file_name)
+                fwd_norm = update_forward_model(forward_dynamics_model, Ts, checkpoint_name=experiment_directory_name)
                 first_update = True # done
 
         if args.model_based == "backward":
             if (not first_update and t >= 1000) or (t >= args.bwd_model_update_freq and t % args.bwd_model_update_freq == 0):
-                bwd_norm = update_backward_model(backward_dynamics_model, Ts, checkpoint_name=file_name)
+                bwd_norm = update_backward_model(backward_dynamics_model, Ts, checkpoint_name=experiment_directory_name)
                 first_update = True # done
 
         if args.model_based == "forward":
@@ -199,7 +215,7 @@ if __name__ == "__main__":
                     t_s = t_s.cpu().numpy()
                     t_a = t_a.cpu().numpy()
 
-                    for model_depth in range(args.imagination_depth):
+                    for _ in range(args.imagination_depth):
                         # add noise to actions and predict
                         t_a =  (t_a + np.random.normal(0, max_action*args.expl_noise/10,
                                                        (t_a.shape[0], t_a.shape[1]))).clip(-max_action, max_action)
@@ -207,7 +223,7 @@ if __name__ == "__main__":
                         fwd_input = np.hstack((t_s, t_a))
                         fwd_input = apply_norm(fwd_input, fwd_norm[0]) # normalize the data before feeding in
 
-                        fwd_input = torch.tensor(fwd_input).float().cuda()
+                        fwd_input = torch.tensor(fwd_input).float().to(device)
                         fwd_output = forward_dynamics_model.forward(fwd_input)
                         fwd_output = fwd_output.detach().cpu().numpy()
 
@@ -237,7 +253,7 @@ if __name__ == "__main__":
                     t_s = t_s.cpu().numpy()
                     t_a = t_a.cpu().numpy()
 
-                    for model_depth in range(args.imagination_depth):
+                    for _ in range(args.imagination_depth):
                         # add noise to actions and predict
                         t_a =  (t_a + np.random.normal(0, max_action*args.expl_noise/10,
                                                        (t_a.shape[0], t_a.shape[1]))).clip(-max_action, max_action)
@@ -245,7 +261,7 @@ if __name__ == "__main__":
                         bwd_input = np.hstack((t_s, t_a)) # using the next state in backward dynamics
                         bwd_input = apply_norm(bwd_input, bwd_norm[0]) # normalize the data before feeding in
 
-                        bwd_input = torch.tensor(bwd_input).float().cuda()
+                        bwd_input = torch.tensor(bwd_input).float().to(device)
                         bwd_output = backward_dynamics_model.forward(bwd_input)
                         bwd_output = bwd_output.detach().cpu().numpy()
 
@@ -277,25 +293,38 @@ if __name__ == "__main__":
         # Imagined data (forward)
         elif args.model_based == "forward":
             if t >= args.batch_size and t >= args.fwd_model_update_freq:
-                for _ in range(10):
-                    policy.train(fwd_model_replay_buffer, args.batch_size*10)
+                for _ in range(args.model_gradient_times):
+                    policy.train(fwd_model_replay_buffer, args.batch_size)
+                policy.train(replay_buffer, args.batch_size)
+
 
         # Imagined data (backward)
         elif args.model_based == "backward":
             if t >= args.batch_size and t >= args.bwd_model_update_freq:
-                for _ in range(10):
-                    policy.train(bwd_model_replay_buffer, args.batch_size*10)
+                for _ in range(args.model_gradient_times):
+                    policy.train(bwd_model_replay_buffer, args.batch_size)
+                policy.train(replay_buffer, args.batch_size)
 
         else:
             print('Something wrong.')
 
+
+        if args.log_training and done:
+            logger.log(state=state,
+                       action=action,
+                       reward=reward,
+                       done=done,
+                       episode_num=episode_num,
+                       episode_reward=episode_reward,
+                       episode_timesteps=episode_timesteps,
+                       total_timesteps=t)
+
         if done:
             # +1 to account for 0 indexing. +0 on ep_timesteps since it will increment +1 even if done=True
-            print(
-                f"Total T: {t+1} Episode Num: {episode_num+1} Episode T: {episode_timesteps} Reward: {episode_reward:.3f}")
-            writer.add_scalars('reward',
-                           {'episode_reward' : episode_reward},
-                           t)
+            print(f"Total T: {t+1} Episode Num: {episode_num+1} Episode T: {episode_timesteps} Reward: {episode_reward:.3f}")
+            if args.tensorboard:
+                writer.add_scalars('reward',
+                               {'episode_reward' : episode_reward}, t)
 
             # Reset environment
             state, done = env.reset(), False
@@ -309,13 +338,13 @@ if __name__ == "__main__":
         # Evaluate episode
         if (t + 1) % args.eval_freq == 0:
             evaluations.append(eval_policy(policy, args.env_name, args.seed))
-            np.save("./results/%s" % (file_name), evaluations)
+            # np.save("./results/%s" % (file_name), evaluations)
 
     # save the model
     print('-- SAVING THE MODEL --')
     if args.save_models:
-        with open("./results/TrainingLogs/" + experiment_directory_name +"/" + "model.pkl", "wb") as file_:
+        with open(args.log_path + experiment_directory_name +"/" + "model.pkl", "wb") as file_:
             pickle.dump(policy, file_, -1)
     print('-- MODEL SAVED --')
 
-    writer.close()
+    if args.tensorboard: writer.close()

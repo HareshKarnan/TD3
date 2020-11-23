@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 from tqdm import trange
@@ -5,7 +6,7 @@ from tensorboardX import SummaryWriter
 from random import random
 from torch.utils import data
 import torch.nn as nn
-
+import csv
 
 class ReplayBuffer(object):
 	def __init__(self, state_dim, action_dim, max_size=int(1e6)):
@@ -46,7 +47,7 @@ class ReplayBuffer(object):
 
 def apply_norm(dataset, norm):
     """Normalizes data given a (mean, std) tuple"""
-    return (dataset - norm[0]) / norm[1]
+    return (dataset - norm[0]) / (norm[1] + 1e-8)
 
 def unapply_norm(dataset, norm):
     """Inverse operation of _apply_norm"""
@@ -61,6 +62,7 @@ def train_model_es(model,
                    v_size=0.2,
                    patience=10,
 				   num_cores=30,
+				   device="cpu",
 				   checkpoint_name='checkpoint.pt'):
     """Trains a model from given labels with early stopping
 
@@ -125,8 +127,8 @@ def train_model_es(model,
         # Train for one epoch
         model.train() # prep for training
         for x_batch, y_batch in train_loader:
-            x_batch = x_batch.to('cuda')
-            y_batch = y_batch.to('cuda')
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
             y_pred = model.forward(x_batch)
             loss = criterion(y_pred, y_batch)
             print('\repoch: '+str(epoch)+ ' loss: '+str(loss.item()), end='')
@@ -141,18 +143,11 @@ def train_model_es(model,
         # Validate model
         model.eval() # prep for evaluation
         for x_batch, y_batch in valid_loader:
-            x_batch = x_batch.to('cuda')
-            y_batch = y_batch.to('cuda')
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
             y_pred = model.forward(x_batch)
             loss = criterion(y_pred, y_batch)
             valid_losses.append(loss.item())
-
-        # writer.add_scalars('data/err_vs_epoch',
-        #                    {'train_loss' : float(np.average(train_losses))},
-        #                    epoch)
-        # writer.add_scalars('data/err_vs_epoch',
-        #                    {'valid_loss' : float(np.average(valid_losses))},
-        #                    epoch)
 
         train_loss = np.average(train_losses)
         valid_loss = np.average(valid_losses)
@@ -163,8 +158,8 @@ def train_model_es(model,
             best_loss = valid_loss
             torch.save(model.state_dict(), checkpoint_name)
         print('current best:', best_loss, '(epoch', best_epoch, ')')
+
     model.load_state_dict(torch.load(checkpoint_name))
-    # writer.close()
 
 def update_forward_model(model, Ts, checkpoint_name='xyz'):
 	"""
@@ -191,7 +186,7 @@ def update_forward_model(model, Ts, checkpoint_name='xyz'):
 	Y_list_normalized = apply_norm(Y_list, Y_norm)
 
 	criterion = torch.nn.MSELoss()
-	optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+	optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
 
 	print('--- TRAINING THE FORWARD DYNAMICS MODEL --- ')
 
@@ -231,9 +226,9 @@ def update_backward_model(model, Ts, checkpoint_name='xyz'):
 	Y_list_normalized = apply_norm(Y_list,Y_norm)
 
 	criterion = torch.nn.MSELoss()
-	optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+	optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
 
-	print('--- TRAINING THE BACKWARD DYNAMICS MODEL --- ')
+	print('--- TRAINING THE INVERSE DYNAMICS MODEL --- ')
 
 	train_model_es(model,
 				   X_list_normalized,
@@ -242,7 +237,7 @@ def update_backward_model(model, Ts, checkpoint_name='xyz'):
 				   criterion,
 				   checkpoint_name=checkpoint_name+'_bwd.pt')
 
-	print('            --- TRAINING DONE ---           ')
+	print('        --- INVERSE MODEL TRAINING DONE ---           ')
 
 	return X_norm, Y_norm
 
@@ -251,3 +246,27 @@ def set_seed(env, seed):
 	env.seed(seed)
 	torch.manual_seed(seed)
 	np.random.seed(seed)
+
+
+class Logger:
+	def __init__(self, log_name, log_root):
+		self.log_name = log_name
+		self.log_path = log_root + log_name + '/' + 'log.csv'
+		if not os.path.exists(log_root + log_name + '/'): os.makedirs(log_root + log_name + '/')
+		print('## STARTED LOGGER ##')
+
+	def log(self,
+			state,
+			action,
+			reward,
+			done,
+			episode_num,
+			episode_reward,
+			episode_timesteps,
+			total_timesteps,):
+		with open(self.log_path, 'a', newline='') as csvfile:
+			csvwriter = csv.writer(csvfile)
+			csvwriter.writerow([reward, done, episode_num, episode_reward, episode_timesteps, total_timesteps])
+
+
+
