@@ -10,15 +10,15 @@ echo "Cleared /u/pstone/agents6/haresh/MBTD3/logs/*"
 export CUDA_VISIBLE_DEVICES=0
 
 # number of seeds to run
-num_seeds=1
+num_seeds=10
 
 which python
 
 time_steps=(1000000)
 fwd_update_freq=(5e3)
-envs=("InvertedPendulum-v2")
-model_iters=(2 10 100)
-model_gradient_times=(1 2 5 10)
+envs=("InvertedPendulumPyBulletEnv-v0")
+model_iters=(2 5 10)
+model_gradient_times=(1 2 5)
 n=1
 
 # script to run experiments

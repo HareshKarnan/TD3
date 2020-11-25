@@ -5,8 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 # Implementation of Twin Delayed Deep Deterministic Policy Gradients (TD3)
 # Paper: https://arxiv.org/abs/1802.09477
 
@@ -71,11 +69,12 @@ class TD3(object):
 		state_dim, 
 		action_dim, 
 		max_action,
+		device,
 		discount=0.99, 
 		tau=0.005, 
 		policy_noise=0.2, 
 		noise_clip=0.5, 
-		policy_freq=2
+		policy_freq=2,
 	):
 	
 		self.actor = Actor(state_dim, action_dim, max_action).to(device)
@@ -95,13 +94,21 @@ class TD3(object):
 
 		self.total_it = 0
 
+		self.device = device
+
 
 	def select_action(self, state):
-		state = torch.FloatTensor(state.reshape(1, -1)).to(device)
+		state = torch.FloatTensor(state.reshape(1, -1)).to(self.device)
 		return self.actor(state).cpu().data.numpy().flatten()
 
 
-	def train(self, replay_buffer, batch_size=100):
+	def train(self, replay_buffer, batch_size=100, learning_rate=3e-4):
+
+		# use a different learning rate when updating actor and critic
+		# using synthetic experience from model
+		self.critic_optimizer.param_groups[0]['lr'] = learning_rate
+		self.actor_optimizer.param_groups[0]['lr'] = learning_rate
+
 		self.total_it += 1
 
 		# Sample replay buffer 

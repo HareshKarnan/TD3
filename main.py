@@ -1,19 +1,27 @@
+import os, shutil
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import numpy as np
 import torch
+import pybulletgym
 import gym
 import argparse
-import os, shutil
 import utils
 import TD3
 import OurDDPG
 import DDPG
 import pickle
 from random import random
-from tensorboardX import SummaryWriter
 from network import Net
-from utils import update_backward_model,update_forward_model
-from utils import unapply_norm, apply_norm, set_seed
+from utils import update_backward_model, update_forward_model
+from utils import unapply_norm, apply_norm, set_seed, _duplicate_batch_wise
 from tqdm import trange
+
+torch.set_num_threads(1)
 
 # Runs policy for X episodes and returns average reward
 def eval_policy(policy, env_name, seed, eval_episodes=10):
@@ -66,6 +74,8 @@ if __name__ == "__main__":
     parser.add_argument("--log_training", action="store_true")  # Log current reward, timesteps, done to file for reading from later
     parser.add_argument("--log_path", default="logs/") # root path for storing the experiment logs and saved models
     parser.add_argument("--use_cuda", action="store_true")  # Use cuda acceleration
+    parser.add_argument("--actor_critic_model_lr", default=3e-5, type=float)  # Learning rate to use when updating the actor-critic from model
+
     args = parser.parse_args()
 
     file_name = "%s_%s_%s_%s" % (args.policy_name, args.env_name, str(args.model_based), str(args.seed))
@@ -76,8 +86,10 @@ if __name__ == "__main__":
     # if not os.path.exists("./results"):
     #     os.makedirs("./results")
 
-    if args.use_cuda and torch.cuda.is_available() : device = "cuda"
-    else: device = "cpu"
+    if args.use_cuda and torch.cuda.is_available() :
+        print('Using CUDA !')
+        device = torch.device("cuda")
+    else: device = torch.device("cpu")
 
     experiment_directory_name = \
     str(args.policy_name) + \
@@ -89,11 +101,25 @@ if __name__ == "__main__":
     '_' + str(args.seed)
 
     # did experiment launch already ?
-    if(os.path.exists(args.log_path+experiment_directory_name)):
-        shutil.rmtree(args.log_path + experiment_directory_name)
+    chkpt_episode_num, chkpt_timesteps = 0, 0
+    if(os.path.exists(args.log_path + experiment_directory_name)):
+        print('experiment exists in disk. Loading files.')
+        policy = pickle.load(open(args.log_path + experiment_directory_name + '/policy.pkl', 'rb', -1))
+        # replay_buffer = pickle.load(open(args.log_path + experiment_directory_name + '/replay_buffer.pkl', 'rb', -1))
+        with open(args.log_path + experiment_directory_name + '/log.csv') as csvfile:
+            import csv
+            csvreader = csv.reader(csvfile)
+            for row in csvreader:
+                reward, done, episode_num, episode_reward, episode_timesteps, total_timesteps = row
+            chkpt_episode_num, chkpt_timesteps = episode_num, total_timesteps
+
+        chkpt_timesteps = int(chkpt_timesteps) + 1
+        chkpt_episode_num = int(chkpt_episode_num) + 1
 
     # create writer for tensorboard logging
-    if args.tensorboard: writer = SummaryWriter(log_dir='tblogs/' + experiment_directory_name)
+    # if args.tensorboard:
+    #     from tensorboardX import SummaryWriter
+    #     writer = SummaryWriter(log_dir='tblogs/' + experiment_directory_name)
 
     if args.log_training: logger = utils.Logger(log_name = experiment_directory_name,
                                                 log_root=args.log_path)
@@ -102,7 +128,6 @@ if __name__ == "__main__":
     print('-- CREATED ENVIRONMENT -- ')
 
     set_seed(env, seed=args.seed)   # set seeds
-
 
     state_dim, action_dim = env.observation_space.shape[0], env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
@@ -128,38 +153,40 @@ if __name__ == "__main__":
     }
 
     # Initialize policy
-
-    if args.load_model == "None":
-        print('-- LOADING RANDOM POLICY --')
-        if args.policy_name == "TD3":
-            # Target policy smoothing is scaled wrt the action scale
-            kwargs["policy_noise"] = args.policy_noise * max_action
-            kwargs["noise_clip"] = args.noise_clip * max_action
-            kwargs["policy_freq"] = args.policy_freq
-            policy = TD3.TD3(**kwargs)
-        elif args.policy_name == "OurDDPG":
-            policy = OurDDPG.DDPG(**kwargs)
-        elif args.policy_name == "DDPG":
-            policy = DDPG.DDPG(**kwargs)
-    else:
-        print('-- LOADING PRETRAINED POLICY --')
-        policy = pickle.load(open(args.load_model, "rb", -1))
+    if chkpt_episode_num==0:
+        if args.load_model == "None":
+            print('-- LOADING RANDOM POLICY --')
+            if args.policy_name == "TD3":
+                # Target policy smoothing is scaled wrt the action scale
+                kwargs["policy_noise"] = args.policy_noise * max_action
+                kwargs["noise_clip"] = args.noise_clip * max_action
+                kwargs["policy_freq"] = args.policy_freq
+                kwargs["device"] = device
+                policy = TD3.TD3(**kwargs)
+            elif args.policy_name == "OurDDPG":
+                policy = OurDDPG.DDPG(**kwargs)
+            elif args.policy_name == "DDPG":
+                policy = DDPG.DDPG(**kwargs)
+        else:
+            print('-- LOADING PRETRAINED POLICY --')
+            policy = pickle.load(open(args.load_model, "rb", -1))
 
     ########### SETTING REPLAY BUFFERS HERE ###########
-    replay_buffer = utils.ReplayBuffer(state_dim, action_dim)
+    replay_buffer = utils.ReplayBuffer(state_dim, action_dim, device)
+
     # introduce 2 new replay buffers to store synthetic transitions
     if args.model_based == "forward":
-        fwd_model_replay_buffer = utils.ReplayBuffer(state_dim, action_dim, max_size=int(1e7))
+        fwd_model_replay_buffer = utils.ReplayBuffer(state_dim, action_dim, device, max_size=int(1e7))
 
     if args.model_based == "backward":
-        bwd_model_replay_buffer = utils.ReplayBuffer(state_dim, action_dim, max_size=int(1e7))
+        bwd_model_replay_buffer = utils.ReplayBuffer(state_dim, action_dim, device, max_size=int(1e7))
 
 
     # Evaluate untrained policy
     evaluations = [eval_policy(policy, args.env_name, args.seed)]
 
     state, done = env.reset(), False
-    episode_reward, episode_timesteps, episode_num = 0, 0, 0
+    episode_reward, episode_timesteps, episode_num = 0, 0, 0 + chkpt_episode_num
 
     if args.model_based is not "None":
         print(' ~~ MODEL BASED METHOD IN USE ~~')
@@ -169,7 +196,7 @@ if __name__ == "__main__":
     else:
         print('~~ MODEL FREE METHOD ~~')
 
-    for t in range(int(args.max_timesteps)):
+    for t in range(chkpt_timesteps, int(args.max_timesteps)):
 
         episode_timesteps += 1
 
@@ -194,54 +221,47 @@ if __name__ == "__main__":
         # Store data in replay buffer
         replay_buffer.add(state, action, next_state, reward, done_bool)
 
-        # update the forward and backward models here
-        if args.model_based == "forward":
-            if (not first_update and t >= 1000) or (t >= args.fwd_model_update_freq and t % args.fwd_model_update_freq == 0):
-                fwd_norm = update_forward_model(forward_dynamics_model, Ts, checkpoint_name=experiment_directory_name)
-                first_update = True # done
-
-        if args.model_based == "backward":
-            if (not first_update and t >= 1000) or (t >= args.bwd_model_update_freq and t % args.bwd_model_update_freq == 0):
-                bwd_norm = update_backward_model(backward_dynamics_model, Ts, checkpoint_name=experiment_directory_name)
-                first_update = True # done
-
         if args.model_based == "forward":
             # add imagined trajectories from fwd model into fwd_model_replay_buffer
             if first_update: # model has been updated atleast once
                 forward_dynamics_model.eval() # model has a dropout layer !
 
-                for _ in range(args.model_iters): # collect 100 times the data
-                    t_s, t_a, t_ns, t_r, t_nd = replay_buffer.sample(args.batch_size)
-                    t_s = t_s.cpu().numpy()
-                    t_a = t_a.cpu().numpy()
+                t_s, t_a, t_ns, t_r, t_nd = _duplicate_batch_wise(state, args.model_iters, device, True), \
+                                            _duplicate_batch_wise(action, args.model_iters, device, True), \
+                                            _duplicate_batch_wise(next_state, args.model_iters, device, True), \
+                                            _duplicate_batch_wise(reward, args.model_iters, device, True), \
+                                            _duplicate_batch_wise(done, args.model_iters, device, True), \
 
-                    for _ in range(args.imagination_depth):
-                        # add noise to actions and predict
-                        t_a =  (t_a + np.random.normal(0, max_action*args.expl_noise/10,
-                                                       (t_a.shape[0], t_a.shape[1]))).clip(-max_action, max_action)
+                t_s = t_s.cpu().numpy()
+                t_a = t_a.cpu().numpy()
 
-                        fwd_input = np.hstack((t_s, t_a))
-                        fwd_input = apply_norm(fwd_input, fwd_norm[0]) # normalize the data before feeding in
+                for _ in range(args.imagination_depth):
+                    # add noise to actions and predict
+                    t_a =  (t_a + np.random.normal(0, max_action*args.expl_noise/10,
+                                                   (t_a.shape[0], t_a.shape[1]))).clip(-max_action, max_action)
 
-                        fwd_input = torch.tensor(fwd_input).float().to(device)
-                        fwd_output = forward_dynamics_model.forward(fwd_input)
-                        fwd_output = fwd_output.detach().cpu().numpy()
+                    fwd_input = np.hstack((t_s, t_a))
+                    fwd_input = apply_norm(fwd_input, fwd_norm[0]) # normalize the data before feeding in
 
-                        fwd_output = unapply_norm(fwd_output, fwd_norm[1]) # unnormalize the output data
+                    fwd_input = torch.tensor(fwd_input).float().to(device)
+                    fwd_output = forward_dynamics_model.forward(fwd_input)
+                    fwd_output = fwd_output.detach().cpu().numpy()
 
-                        t_ns = fwd_output[:, :-1] + t_s # predicted next state = predicted delta next state + current state
-                        t_r = fwd_output[:, -1] # predicted reward
+                    fwd_output = unapply_norm(fwd_output, fwd_norm[1]) # unnormalize the output data
 
-                        for k in range(t_s.shape[0]):
-                            fwd_model_replay_buffer.add(t_s[k], t_a[k], t_ns[k], t_r[k], False) # store predicted forward transition in buffer
+                    t_ns = fwd_output[:, :-1] + t_s # predicted next state = predicted delta next state + current state
+                    t_r = fwd_output[:, -1] # predicted reward
 
-                        if args.imagination_depth > 1:
-                            # get ready for next transition
-                            t_s = t_ns
-                            print('Aquiring samples of next actions and states to query ~forward model~')
-                            for k in trange(t_s.shape[0]):
-                                t_a[k] = (policy.select_action(np.array(t_s[k]))
-                                       + np.random.normal(0, max_action * args.expl_noise, size=action_dim)).clip(-max_action, max_action)
+                    for k in range(t_s.shape[0]):
+                        fwd_model_replay_buffer.add(t_s[k], t_a[k], t_ns[k], t_r[k], False) # store predicted forward transition in buffer
+
+                    if args.imagination_depth > 1:
+                        # get ready for next transition
+                        t_s = t_ns
+                        print('Aquiring samples of next actions and states to query ~forward model~')
+                        for k in trange(t_s.shape[0]):
+                            t_a[k] = (policy.select_action(np.array(t_s[k]))
+                                   + np.random.normal(0, max_action * args.expl_noise, size=action_dim)).clip(-max_action, max_action)
 
         if args.model_based == "backward":
             # add imagined trajectories from fwd model into fwd_model_replay_buffer
@@ -281,6 +301,20 @@ if __name__ == "__main__":
                                 t_a[k] = (policy.select_action(np.array(t_s[k]))
                                        + np.random.normal(0, max_action * args.expl_noise, size=action_dim)).clip(-max_action, max_action)
 
+        # update the forward and backward models here
+        if args.model_based == "forward":
+            if (not first_update and t - chkpt_timesteps >= 1e3) or (first_update and t >= args.fwd_model_update_freq and t % args.fwd_model_update_freq == 0):
+                print('updating fwd model')
+                fwd_norm = update_forward_model(forward_dynamics_model, Ts, checkpoint_name=experiment_directory_name)
+                first_update = True # done
+
+        if args.model_based == "backward":
+            if (not first_update and t  - chkpt_timesteps >= 1e3) or (first_update and t >= args.bwd_model_update_freq and t % args.bwd_model_update_freq == 0):
+                print('updating bwd model')
+                bwd_norm = update_backward_model(backward_dynamics_model, Ts, checkpoint_name=experiment_directory_name)
+                first_update = True # done
+
+
         state = next_state
         episode_reward += reward
 
@@ -292,22 +326,24 @@ if __name__ == "__main__":
 
         # Imagined data (forward)
         elif args.model_based == "forward":
-            if t >= args.batch_size and t >= args.fwd_model_update_freq:
+            # model based update
+            if first_update and t >= args.batch_size and t >= args.fwd_model_update_freq and t-chkpt_timesteps > 2e3:
                 for _ in range(args.model_gradient_times):
-                    policy.train(fwd_model_replay_buffer, args.batch_size)
+                    policy.train(fwd_model_replay_buffer, args.batch_size, learning_rate=args.actor_critic_model_lr)
+            # model free update
+            if t >= args.batch_size:
                 policy.train(replay_buffer, args.batch_size)
 
 
         # Imagined data (backward)
         elif args.model_based == "backward":
-            if t >= args.batch_size and t >= args.bwd_model_update_freq:
+            # model based update
+            if first_update and t >= args.batch_size and t >= args.bwd_model_update_freq and t-chkpt_timesteps > 2e3:
                 for _ in range(args.model_gradient_times):
-                    policy.train(bwd_model_replay_buffer, args.batch_size)
+                    policy.train(bwd_model_replay_buffer, args.batch_size, learning_rate=args.actor_critic_model_lr)
+            # model free update
+            if t >= args.batch_size:
                 policy.train(replay_buffer, args.batch_size)
-
-        else:
-            print('Something wrong.')
-
 
         if args.log_training and done:
             logger.log(state=state,
@@ -322,9 +358,9 @@ if __name__ == "__main__":
         if done:
             # +1 to account for 0 indexing. +0 on ep_timesteps since it will increment +1 even if done=True
             print(f"Total T: {t+1} Episode Num: {episode_num+1} Episode T: {episode_timesteps} Reward: {episode_reward:.3f}")
-            if args.tensorboard:
-                writer.add_scalars('reward',
-                               {'episode_reward' : episode_reward}, t)
+            # if args.tensorboard:
+            #     writer.add_scalars('reward',
+            #                    {'episode_reward' : episode_reward}, t)
 
             # Reset environment
             state, done = env.reset(), False
@@ -335,6 +371,13 @@ if __name__ == "__main__":
                 Ts.extend(T)
                 T = [[]]  #
 
+            # checkpointing script to run in condor
+            if episode_num>0 and episode_num%10==0:
+                # with open(args.log_path + experiment_directory_name + "/replay_buffer.pkl", "wb") as file_:
+                #     pickle.dump(replay_buffer, file_)
+                with open(args.log_path + experiment_directory_name + "/policy.pkl", "wb") as file_:
+                    pickle.dump(policy, file_)
+
         # Evaluate episode
         if (t + 1) % args.eval_freq == 0:
             evaluations.append(eval_policy(policy, args.env_name, args.seed))
@@ -343,8 +386,8 @@ if __name__ == "__main__":
     # save the model
     print('-- SAVING THE MODEL --')
     if args.save_models:
-        with open(args.log_path + experiment_directory_name +"/" + "model.pkl", "wb") as file_:
+        with open(args.log_path + experiment_directory_name + "/model.pkl", "wb") as file_:
             pickle.dump(policy, file_, -1)
     print('-- MODEL SAVED --')
 
-    if args.tensorboard: writer.close()
+    # if args.tensorboard: writer.close()

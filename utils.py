@@ -1,15 +1,22 @@
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import numpy as np
 import torch
 from tqdm import trange
-from tensorboardX import SummaryWriter
 from random import random
 from torch.utils import data
 import torch.nn as nn
 import csv
+torch.set_num_threads(1)
+
 
 class ReplayBuffer(object):
-	def __init__(self, state_dim, action_dim, max_size=int(1e6)):
+	def __init__(self, state_dim, action_dim, device, max_size=int(1e6)):
 		self.max_size = max_size
 		self.ptr = 0
 		self.size = 0
@@ -20,8 +27,8 @@ class ReplayBuffer(object):
 		self.reward = np.zeros((max_size, 1))
 		self.not_done = np.zeros((max_size, 1))
 
-		self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+		# self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+		self.device = device
 
 	def add(self, state, action, next_state, reward, done):
 		self.state[self.ptr] = state
@@ -106,13 +113,13 @@ def train_model_es(model,
         dataset=train_data,
         shuffle=True,
         batch_size=1024,
-        num_workers=0)
+        num_workers=1)
 
     valid_loader = data.DataLoader(
         dataset=valid_data,
         shuffle=True,
         batch_size=1024,
-        num_workers=0)
+        num_workers=1)
 
     # train the model
     epoch = 0
@@ -156,10 +163,11 @@ def train_model_es(model,
         if best_loss is None or valid_loss < best_loss:
             best_epoch = epoch
             best_loss = valid_loss
-            torch.save(model.state_dict(), checkpoint_name)
+            torch.save(model.state_dict(), checkpoint_name+'.pt')
         print('current best:', best_loss, '(epoch', best_epoch, ')')
 
-    model.load_state_dict(torch.load(checkpoint_name))
+    model.load_state_dict(torch.load(checkpoint_name+'.pt'))
+    os.remove(checkpoint_name+'.pt')
 
 def update_forward_model(model, Ts, checkpoint_name='xyz'):
 	"""
@@ -269,4 +277,8 @@ class Logger:
 			csvwriter.writerow([reward, done, episode_num, episode_reward, episode_timesteps, total_timesteps])
 
 
-
+def _duplicate_batch_wise(arr, batch_size: int, device, return_tensor=False):
+	arr = np.asarray(arr).copy()
+	if(len(arr.shape)<2) : arr = np.expand_dims(arr, axis=0)
+	if return_tensor: return torch.tensor(np.repeat(arr, batch_size, axis=0)).to(device)
+	else: return np.repeat(arr, batch_size, axis=0).to(device)
