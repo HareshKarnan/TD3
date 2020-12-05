@@ -56,19 +56,19 @@ if __name__ == "__main__":
     parser.add_argument("--fwd_model_update_freq", default=5e3, type=float)  # How often (time steps) we update the forward model
     parser.add_argument("--bwd_model_update_freq", default=5e3, type=float)  # How often (time steps) we update the backward model
     parser.add_argument("--model_gradient_times", default=10, type=int)  # How many different gradient steps per update iteration ?
-
     parser.add_argument("--imagination_depth", default=1, type=int)  # How deep to propagate the fwd model
     parser.add_argument("--max_timesteps", default=1e6, type=int)  # Max time steps to run environment for
     parser.add_argument("--save_models", action="store_true")  # Whether or not models are saved
     parser.add_argument("--load_model", default="None")  # Load a pretrained model
     parser.add_argument("--expl_noise", default=0.1, type=float)  # Std of Gaussian exploration noise
+    parser.add_argument("--state_expl_noise", default=0.1, type=float)  # Std of Gaussian exploration noise for state in the inverse model
     parser.add_argument("--batch_size", default=256, type=int)  # Batch size for both actor and critic
     parser.add_argument("--discount", default=0.99, type=float)  # Discount factor
     parser.add_argument("--tau", default=0.005, type=float)  # Target network update rate
     parser.add_argument("--policy_noise", default=0.2, type=float)  # Noise added to target policy during critic update
     parser.add_argument("--noise_clip", default=0.5, type=float)  # Range to clip target policy noise
     parser.add_argument("--policy_freq", default=2, type=int)  # Frequency of delayed policy updates
-    parser.add_argument("--model_based", default="None")  # What model should we use choose from forward / backward / None
+    parser.add_argument("--model_based", default="None")  # What model should we use choose from forward / backward / None / dual
     parser.add_argument("--model_iters", default=100, type=int)  # Frequency of delayed policy updates
     parser.add_argument("--tensorboard", action="store_true")  # Show tensorboard logging ?
     parser.add_argument("--log_training", action="store_true")  # Log current reward, timesteps, done to file for reading from later
@@ -98,6 +98,7 @@ if __name__ == "__main__":
     '_timesteps_' + str(args.max_timesteps) + \
     '_M_iters_' + str(args.model_iters) + \
     '_M_grad_' + str(args.model_gradient_times) + \
+    '_stateexplNoise_' + str(args.state_expl_noise) + \
     '_' + str(args.seed)
 
     # did experiment launch already ?
@@ -131,17 +132,18 @@ if __name__ == "__main__":
 
     state_dim, action_dim = env.observation_space.shape[0], env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
+    max_state = 1.0
 
-    if args.model_based == "forward":
+    if args.model_based == "forward" or args.model_based == "dual":
         forward_dynamics_model = Net(n_feature=state_dim+action_dim,
-                                     n_hidden=64,
+                                     n_hidden=32,
                                      n_output=state_dim+1 # reward is the + 1
                                      ).to(device)
 
-    elif args.model_based == "backward":
-        backward_dynamics_model = Net(n_feature=state_dim + action_dim,
-                                     n_hidden=64,
-                                     n_output=state_dim+1 # reward is the + 1
+    if args.model_based == "backward" or args.model_based == "dual":
+        backward_dynamics_model = Net(n_feature=state_dim*2,
+                                     n_hidden=32,
+                                     n_output=action_dim+1 # reward is the + 1
                                      ).to(device)
 
     kwargs = {
@@ -178,8 +180,11 @@ if __name__ == "__main__":
     if args.model_based == "forward":
         fwd_model_replay_buffer = utils.ReplayBuffer(state_dim, action_dim, device, max_size=int(1e7))
 
-    if args.model_based == "backward":
+    elif args.model_based == "backward":
         bwd_model_replay_buffer = utils.ReplayBuffer(state_dim, action_dim, device, max_size=int(1e7))
+
+    elif args.model_based == "dual":
+        dual_model_replay_buffer = utils.ReplayBuffer(state_dim, action_dim, device, max_size=int(1e7))
 
 
     # Evaluate untrained policy
@@ -221,7 +226,7 @@ if __name__ == "__main__":
         # Store data in replay buffer
         replay_buffer.add(state, action, next_state, reward, done_bool)
 
-        if args.model_based == "forward":
+        if args.model_based == "forward" or args.model_based == "dual":
             # add imagined trajectories from fwd model into fwd_model_replay_buffer
             if first_update: # model has been updated atleast once
                 forward_dynamics_model.eval() # model has a dropout layer !
@@ -230,7 +235,7 @@ if __name__ == "__main__":
                                             _duplicate_batch_wise(action, args.model_iters, device, True), \
                                             _duplicate_batch_wise(next_state, args.model_iters, device, True), \
                                             _duplicate_batch_wise(reward, args.model_iters, device, True), \
-                                            _duplicate_batch_wise(done, args.model_iters, device, True), \
+                                            _duplicate_batch_wise(done, args.model_iters, device, True)
 
                 t_s = t_s.cpu().numpy()
                 t_a = t_a.cpu().numpy()
@@ -252,8 +257,14 @@ if __name__ == "__main__":
                     t_ns = fwd_output[:, :-1] + t_s # predicted next state = predicted delta next state + current state
                     t_r = fwd_output[:, -1] # predicted reward
 
-                    for k in range(t_s.shape[0]):
-                        fwd_model_replay_buffer.add(t_s[k], t_a[k], t_ns[k], t_r[k], False) # store predicted forward transition in buffer
+                    # add to replay buffer
+                    # store predicted forward transition in buffer
+                    if args.model_based == "forward":
+                        for k in range(t_s.shape[0]):
+                            fwd_model_replay_buffer.add(t_s[k], t_a[k], t_ns[k], t_r[k], False)
+                    elif args.model_based == "dual":
+                        for k in range(t_s.shape[0]):
+                            dual_model_replay_buffer.add(t_s[k], t_a[k], t_ns[k], t_r[k], False)
 
                     if args.imagination_depth > 1:
                         # get ready for next transition
@@ -263,43 +274,45 @@ if __name__ == "__main__":
                             t_a[k] = (policy.select_action(np.array(t_s[k]))
                                    + np.random.normal(0, max_action * args.expl_noise, size=action_dim)).clip(-max_action, max_action)
 
-        if args.model_based == "backward":
+        if args.model_based == "backward" or args.model_based == "dual":
             # add imagined trajectories from fwd model into fwd_model_replay_buffer
             if first_update: # model has been updated atleast once
                 backward_dynamics_model.eval() # model has a dropout layer !
 
-                for _ in range(args.model_iters): # collect 100 times the data
-                    t_s, t_a, t_ns, t_r, t_nd = replay_buffer.sample(args.batch_size)
-                    t_s = t_s.cpu().numpy()
-                    t_a = t_a.cpu().numpy()
+                t_s, t_a, t_ns, t_r, t_nd = _duplicate_batch_wise(state, args.model_iters, device, True), \
+                                            _duplicate_batch_wise(action, args.model_iters, device, True), \
+                                            _duplicate_batch_wise(next_state, args.model_iters, device, True), \
+                                            _duplicate_batch_wise(reward, args.model_iters, device, True), \
+                                            _duplicate_batch_wise(done, args.model_iters, device, True)
+                t_s = t_s.cpu().numpy()
+                t_ns = t_ns.cpu().numpy()
 
-                    for _ in range(args.imagination_depth):
-                        # add noise to actions and predict
-                        t_a =  (t_a + np.random.normal(0, max_action*args.expl_noise/10,
-                                                       (t_a.shape[0], t_a.shape[1]))).clip(-max_action, max_action)
+                for _ in range(args.imagination_depth):
+                    t_s = (t_s + np.random.normal(0, max_state * args.state_expl_noise / 10,
+                                                  (t_s.shape[0], t_s.shape[1]))).clip(-max_state, max_state)
+                    bwd_input = np.hstack((t_s, t_ns))
+                    bwd_input = apply_norm(bwd_input, bwd_norm[0]) # normalize the data before feeding in
 
-                        bwd_input = np.hstack((t_s, t_a)) # using the next state in backward dynamics
-                        bwd_input = apply_norm(bwd_input, bwd_norm[0]) # normalize the data before feeding in
+                    bwd_input = torch.tensor(bwd_input).float().to(device)
+                    bwd_output = backward_dynamics_model.forward(bwd_input)
+                    bwd_output = bwd_output.detach().cpu().numpy()
 
-                        bwd_input = torch.tensor(bwd_input).float().to(device)
-                        bwd_output = backward_dynamics_model.forward(bwd_input)
-                        bwd_output = bwd_output.detach().cpu().numpy()
+                    bwd_output = unapply_norm(bwd_output, bwd_norm[1]) # unnormalize the output data
 
-                        bwd_output = unapply_norm(bwd_output, bwd_norm[1]) # unnormalize the output data
+                    t_a = bwd_output[:, :-1] # predicted action
+                    t_r = bwd_output[:, -1] # predicted reward
 
-                        t_ps = bwd_output[:, :-1] + t_s # predicted previous state = predicted delta previous state + next state
-                        t_r = bwd_output[:, -1] # predicted reward
+                    # for k in range(t_s.shape[0]):
+                    #     bwd_model_replay_buffer.add(t_ps[k], t_a[k], t_s[k], t_r[k], False) # store predicted backward transition in buffer
 
+                    # add to replay buffer
+                    # store predicted forward transition in buffer
+                    if args.model_based == "backward":
                         for k in range(t_s.shape[0]):
-                            bwd_model_replay_buffer.add(t_ps[k], t_a[k], t_s[k], t_r[k], False) # store predicted backward transition in buffer
-
-                        if args.imagination_depth > 1:
-                            # get ready for next transition
-                            t_s = t_ps
-                            print('Aquiring samples of next actions and states to query ~backward model~')
-                            for k in trange(t_s.shape[0]):
-                                t_a[k] = (policy.select_action(np.array(t_s[k]))
-                                       + np.random.normal(0, max_action * args.expl_noise, size=action_dim)).clip(-max_action, max_action)
+                            bwd_model_replay_buffer.add(t_s[k], t_a[k], t_ns[k], t_r[k], False) # not used
+                    elif args.model_based == "dual":
+                        for k in range(t_s.shape[0]):
+                            dual_model_replay_buffer.add(t_s[k], t_a[k], t_ns[k], t_r[k], False)
 
         # update the forward and backward models here
         if args.model_based == "forward":
@@ -308,9 +321,16 @@ if __name__ == "__main__":
                 fwd_norm = update_forward_model(forward_dynamics_model, Ts, checkpoint_name=experiment_directory_name)
                 first_update = True # done
 
-        if args.model_based == "backward":
+        elif args.model_based == "backward":
             if (not first_update and t  - chkpt_timesteps >= 1e3) or (first_update and t >= args.bwd_model_update_freq and t % args.bwd_model_update_freq == 0):
                 print('updating bwd model')
+                bwd_norm = update_backward_model(backward_dynamics_model, Ts, checkpoint_name=experiment_directory_name)
+                first_update = True # done
+
+        elif args.model_based == "dual":
+            if (not first_update and t  - chkpt_timesteps >= 1e3) or (first_update and t >= args.bwd_model_update_freq and t % args.bwd_model_update_freq == 0):
+                print('updating both models')
+                fwd_norm = update_forward_model(forward_dynamics_model, Ts, checkpoint_name=experiment_directory_name)
                 bwd_norm = update_backward_model(backward_dynamics_model, Ts, checkpoint_name=experiment_directory_name)
                 first_update = True # done
 
@@ -341,6 +361,15 @@ if __name__ == "__main__":
             if first_update and t >= args.batch_size and t >= args.bwd_model_update_freq and t-chkpt_timesteps > 2e3:
                 for _ in range(args.model_gradient_times):
                     policy.train(bwd_model_replay_buffer, args.batch_size, learning_rate=args.actor_critic_model_lr)
+            # model free update
+            if t >= args.batch_size:
+                policy.train(replay_buffer, args.batch_size)
+
+        elif args.model_based == "dual":
+            # model based update
+            if first_update and t >= args.batch_size and t >= args.bwd_model_update_freq and t - chkpt_timesteps > 2e3:
+                for _ in range(args.model_gradient_times):
+                    policy.train(dual_model_replay_buffer, args.batch_size, learning_rate=args.actor_critic_model_lr)
             # model free update
             if t >= args.batch_size:
                 policy.train(replay_buffer, args.batch_size)

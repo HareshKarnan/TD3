@@ -14,11 +14,11 @@ num_seeds=10
 
 which python
 
-time_steps=(1000000)
+time_steps=(100000)
 fwd_update_freq=(5e3)
 envs=("InvertedPendulumPyBulletEnv-v0")
-model_iters=(2 5 10)
-model_gradient_times=(1 2 5)
+model_iters=(1 2)
+model_gradient_times=(1 2 3)
 n=1
 
 # script to run experiments

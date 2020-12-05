@@ -7,7 +7,7 @@ import random
 # files = glob.glob('logs/lambda_expts/*')
 # files = glob.glob('logs/model_free/*')
 # files = glob.glob('logs/fwd_inv_model/*')
-# files = glob.glob('logs/fwd_model/*')
+files = glob.glob('logs/fwd_model/*')
 
 
 def extract_expt_data(files):
@@ -18,8 +18,7 @@ def extract_expt_data(files):
         totalTimesteps = fileName.split('_')[6]
         modelIters = fileName.split('_')[9]
         modelGrads = fileName.split('_')[12]
-        stateNoise = fileName.split('_')[14]
-        seed = fileName.split('_')[15]
+        seed = fileName.split('_')[13]
 
         # print(modelIters, modelGrads, seed)
         # first branch of dict -> model iterations
@@ -28,11 +27,8 @@ def extract_expt_data(files):
         # second branch of dict -> model gradient steps
         if modelGrads not in data[modelIters].keys(): data[modelIters][modelGrads] = {}
 
-        # third branch of dict -> model gradient steps -> modelgrads
-        if stateNoise not in data[modelIters][modelGrads].keys(): data[modelIters][modelGrads][stateNoise] = {}
-
         # third branch of dict -> experiment seed
-        if seed not in data[modelIters][modelGrads][stateNoise].keys(): data[modelIters][modelGrads][stateNoise][seed] = {}
+        if seed not in data[modelIters][modelGrads].keys(): data[modelIters][modelGrads][seed] = {}
 
         # store the data of all seeds here
         with open(fileNamefull+'/log.csv', 'r') as csvfile:
@@ -45,26 +41,36 @@ def extract_expt_data(files):
                     episode.append(int(episode_num))
                     episode_rewards.append(float(episode_reward))
 
-        data[modelIters][modelGrads][stateNoise][seed]['episode_rewards'] = episode_rewards
-        data[modelIters][modelGrads][stateNoise][seed]['episode'] = episode
+        data[modelIters][modelGrads][seed]['episode_rewards'] = episode_rewards
+        data[modelIters][modelGrads][seed]['episode'] = episode
 
     return data
 
-data = extract_expt_data(glob.glob('logs/dual_state_expl_2/*'))
+fwd_data = extract_expt_data(glob.glob('logs/fwd_model/*'))
+fwd_inv_data = extract_expt_data(glob.glob('logs/dual_final/*'))
+model_free_data = extract_expt_data(glob.glob('logs/model_free/*'))
 
 # find the mean and std across expts
 ax = plt.subplot()
 
-for modelIters in data.keys():
-    for modelGrads in data[modelIters].keys():
-        for stateNoise in data[modelIters][modelGrads].keys():
+for i, data in enumerate([fwd_data, fwd_inv_data, model_free_data]):
+    for modelIters in data.keys():
+        for modelGrads in data[modelIters].keys():
+
+
+            # select the right experiment here
+            if i == 0 and (modelIters != '1' or modelGrads != '3'): continue
+            if i == 1 and (modelIters != '1' or modelGrads != '2'): continue
+
+            print(i, modelIters, modelGrads, type(modelIters), type(modelGrads))
+
             color = (random.random(), random.random(), random.random())
             # print('found seeds :: ', data[modelIters][modelGrads].keys())
             dataX, dataY = [], []
 
-            for seed in data[modelIters][modelGrads][stateNoise].keys():
-                episode = data[modelIters][modelGrads][stateNoise][seed]['episode']
-                episodeRew = data[modelIters][modelGrads][stateNoise][seed]['episode_rewards']
+            for seed in data[modelIters][modelGrads].keys():
+                episode = data[modelIters][modelGrads][seed]['episode']
+                episodeRew = data[modelIters][modelGrads][seed]['episode_rewards']
                 dataY.append(episodeRew)
                 dataX.append(episode)
 
@@ -73,8 +79,19 @@ for modelIters in data.keys():
             dataX = [datX[:minX] for datX in dataX]
             dataY = [datY[:minX] for datY in dataY]
             dataY = np.asarray(dataY)
+            if i==0:
+                label = 'Forward Model'
+                color = (0, 0, 1)
+                # continue
+            elif i==1:
+                label = 'Forward + Inverse Model'
+                color = (0, 1, 0)
+                # continue
+            elif i==2:
+                label = 'Model Free'
+                color = (1, 0, 0)
 
-            ax.plot(dataX[0], np.mean(dataY, axis=0), color=color, label='MI_'+modelIters+'_MG_'+modelGrads+'_SN_'+stateNoise)
+            ax.plot(dataX[0], np.mean(dataY, axis=0), color=color, label=label)
             ax.fill_between( dataX[0],
                              np.mean(dataY, axis=0) - np.std(dataY, axis=0)/np.sqrt(10),
                              np.mean(dataY, axis=0) + np.std(dataY, axis=0)/np.sqrt(10),
@@ -83,6 +100,8 @@ for modelIters in data.keys():
 
             plt.legend()
 
+plt.ylim([0, 900])
+plt.xlim([0, 250])
 plt.xlabel('Episodes')
 plt.ylabel('Episode Returns')
 plt.show()
