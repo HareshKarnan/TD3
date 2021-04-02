@@ -82,19 +82,23 @@ for i, data in enumerate([fwd_data, fwd_inv_data, model_free_data]):
             if i==0:
                 label = 'Forward Model'
                 color = (0, 0, 1)
+                exptnums = 10
                 # continue
             elif i==1:
                 label = 'Forward + Inverse Model'
                 color = (0, 1, 0)
-                # continue
+                exptnums = 5
+
+                continue
             elif i==2:
                 label = 'Model Free'
                 color = (1, 0, 0)
+                exptnums = 10
 
             ax.plot(dataX[0], np.mean(dataY, axis=0), color=color, label=label)
             ax.fill_between( dataX[0],
-                             np.mean(dataY, axis=0) - np.std(dataY, axis=0)/np.sqrt(10),
-                             np.mean(dataY, axis=0) + np.std(dataY, axis=0)/np.sqrt(10),
+                             np.mean(dataY, axis=0) - np.std(dataY, axis=0)/np.sqrt(exptnums),
+                             np.mean(dataY, axis=0) + np.std(dataY, axis=0)/np.sqrt(exptnums),
                              alpha=0.25,
                               color=color)
 
@@ -104,5 +108,6 @@ plt.ylim([0, 900])
 plt.xlim([0, 250])
 plt.xlabel('Episodes')
 plt.ylabel('Episode Returns')
+plt.savefig('fwd_model.png')
 plt.show()
 
